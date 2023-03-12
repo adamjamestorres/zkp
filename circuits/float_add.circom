@@ -194,8 +194,13 @@ template CheckWellFormedness(k, p) {
 template RightShift(shift) {
     signal input x;
     signal output y;
-    var t = (x >> shift);
-    y <== t;
+
+    signal rem <-- x % (1 << shift);
+    component num2bits = Num2Bits(shift);
+    num2bits.in <== rem;
+
+    y <-- (x - rem) / (1 << shift);
+    x === y * (1 << shift) + rem;
 }
 
 /*
