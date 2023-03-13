@@ -277,6 +277,12 @@ template MSNZB(b) {
     signal output one_hot[b];
 
     // TODO
+    component n2b = Num2Bits(b);
+    if(!skip_checks){
+        assert(in > 0);  
+    }
+    n2b.in <== in;
+    one_hot <== n2b.bits;
 }
 
 /*
