@@ -261,7 +261,7 @@ template LeftShift(shift_bound) {
     signal output y;
 
     //TODO
-    y = (x >> shift);
+    y <-- x >> shift;
 }
 
 /*
