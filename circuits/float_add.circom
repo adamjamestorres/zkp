@@ -1,4 +1,4 @@
-pragma circom 2.0.0;
+ragma circom 2.0.0;
 
 /////////////////////////////////////////////////////////////////////////////////////
 /////////////////////// Templates from the circomlib ////////////////////////////////
@@ -194,8 +194,13 @@ template CheckWellFormedness(k, p) {
 template RightShift(shift) {
     signal input x;
     signal output y;
-    var t = (x >> shift);
-    y <== t;
+
+    signal rem <-- x % (1 << shift);
+    component num2bits = Num2Bits(shift);
+    num2bits.in <== rem;
+
+    y <-- (x - rem) / (1 << shift);
+    x === y * (1 << shift) + rem;
 }
 
 /*
@@ -254,12 +259,11 @@ template LeftShift(shift_bound) {
     signal input shift;
     signal input skip_checks;
     signal output y;
-    component lt = LessThan(shift_bound);
-    lt.in[0] <== shift;
-    lt.in[1] <== shift_bound;
-    lt.out === 1;
-    //TODO
-    y <-- x >> shift;
+    if(!skip_checks){
+        assert(shift < shift_bound);
+    }
+    y <--(x << shift);
+    assert(y >= 0);
 }
 
 /*
@@ -268,30 +272,35 @@ template LeftShift(shift_bound) {
  * The MSNZB is output as a one-hot vector to reduce the number of constraints in the subsequent `Normalize` template.
  * Enforces that `in` is non-zero as MSNZB(0) is undefined.
  * If `skip_checks` = 1, then we don't care about the output and the non-zero constraint is not enforced.
+
  */
 template MSNZB(b) {
     signal input in;
     signal input skip_checks;
     signal output one_hot[b];
-
-    component n2b = Num2Bits(b);
-
-    if(skip_checks != 1){
-        assert(in > 0);  
+    // Temporary one_hot vector
+    var one_hot_temp[b];
+    if(!skip_checks){
+        assert(in != 0);
     }
+    component n2b = Num2Bits(b+1);
     n2b.in <== in;
-    component if_else[b];
-    component is_eq[b];
-    for(var i = 0; i< b; i++){
-        is_eq[i] = IsEqual();
-         //* Checks if `in[0]` == `in[1]` and returns the output in `out`.
-        is_eq[i].in[0] <==  n2b.bits[i];
-        is_eq[i].in[1] <== 1;
-        if_else[i] = IfThenElse();
-        if_else[i].cond <== is_eq[i].out;
-        if_else[i].L <== 1;
-        if_else[i].R <== 0;
-        one_hot[i] <-- (if_else[i].out) & 1 ;
+    // 1. Copy over all of the bits 
+    for (var i = 0; i < b; i++) {
+        one_hot_temp[i] = n2b.bits[i];
+    }
+    // Converts lower bits from the b-2th bit
+    for (var i = b-2; i >= 0; i--) {
+        // If one_hot_temp[i] = 1 and one_hot_temp[i+1] = 1 then this will be 0
+        // If one_hot_temp[i] = 0 and one_hot_temp[i+1] = 1 then this will be 1
+        // If one_hot_temp[i] = 1 and one_hot_temp[i+1] = 0 then this will be 0
+        // If one_hot_temp[i] = 0 and one_hot_temp[i+1] = 0 then this will be 0
+        one_hot_temp[i] = one_hot_temp[i] + one_hot_temp[i + 1] * (1 - one_hot_temp[i]);
+    }
+     // start hot encoding from the b-2th bit
+    one_hot[b-1] <== one_hot_temp[b-1];
+    for (var i = b-2; i >= 0; i--) {
+        one_hot[i] <--  one_hot_temp[i] * (1 - one_hot_temp[i + 1]);
     }
 }
 
@@ -301,26 +310,52 @@ template MSNZB(b) {
  * The output is a floating-point number representing the same value with exponent `e_out` and a *normalized* mantissa `m_out` of `P`+1-bits and precision `P`.
  * Enforces that `m` is non-zero as a zero-value can not be normalized.
  * If `skip_checks` = 1, then we don't care about the output and the non-zero constraint is not enforced.
+
+
+def normalize(k, p, P, e, m):
+    assert(P > p and m != 0)
+    ''' Let ell be the MSNZB of m. Recall that m is a P+1-bit number with precision p.
+        We want to make the mantissa normalized, i.e., bring it to the range [2^P, 2^(P+1)), by shifting it left by P-ell bits.
+        Consequently, we need to decrement the exponent by P-ell.
+        At the same time, we are also increasing precision of mantissa from p to P, so we also need to increment the exponent by P-p.
+        Overall, this means adding (P-p)-(P-ell) = ell-p to the exponent.
+    '''
+    ell = msnzb(m, P+1)
+    m <<= (P - ell)
+    e = e + ell - p
+    return (e, m)
  */
 template Normalize(k, p, P) {
     signal input e;
     signal input m;
     signal input skip_checks;
-    signal output e_out[k];
-    signal output m_out[p];
-    assert(P > p);
-    component msnb =MSNZB(p);
-    component n2be = Num2Bits(k);
-    // TODO
-    if(skip_checks != 1){
-        assert(m > 0);  
-    }
-    msnb.in <== m;
-    msnb.skip_checks <== skip_checks;
-    m_out <== msnb.one_hot;
-    n2be.in <== e;
-    e_out <== n2be.bits;
+    signal output e_out;
+    signal output m_out;
 
+    assert(P > p);
+    if(!skip_checks){
+        assert(m != 0);
+    }
+
+    // helper signals and components 
+    component ls = LeftShift(252);
+    component msn = MSNZB(P+1);
+    msn.in <== m;
+    msn.skip_checks <== skip_checks;
+    signal one_hot[P+1] <== msn.one_hot;
+    //   ell = msnzb(m, P+1)
+    //   e = e + ell - p
+    var ell = 0;
+    for (var i = 0; i <= P; i++) {
+        ell += i * one_hot[i];
+    }
+    var m_shift = P-ell;
+    e_out <== (e + ell - p);
+    //   m <== (P - ell)
+    ls.x <== m;
+    ls.shift <== m_shift;
+    ls.skip_checks <== skip_checks;
+    m_out <== ls.y;
 }
 
 /*
@@ -337,4 +372,5 @@ template FloatAdd(k, p) {
     signal output m_out;
 
     // TODO
+    
 }
