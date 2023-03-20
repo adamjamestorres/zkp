@@ -194,13 +194,8 @@ template CheckWellFormedness(k, p) {
 template RightShift(shift) {
     signal input x;
     signal output y;
-
-    signal rem <-- x % (1 << shift);
-    component num2bits = Num2Bits(shift);
-    num2bits.in <== rem;
-
-    y <-- (x - rem) / (1 << shift);
-    x === y * (1 << shift) + rem;
+    var t = (x >> shift);
+    y <== t;
 }
 
 /*
@@ -259,7 +254,10 @@ template LeftShift(shift_bound) {
     signal input shift;
     signal input skip_checks;
     signal output y;
-
+    component lt = LessThan(shift_bound);
+    lt.in[0] <== shift;
+    lt.in[1] <== shift_bound;
+    lt.out === 1;
     //TODO
     y <-- x >> shift;
 }
@@ -276,13 +274,25 @@ template MSNZB(b) {
     signal input skip_checks;
     signal output one_hot[b];
 
-    // TODO
     component n2b = Num2Bits(b);
-    if(!skip_checks){
+
+    if(skip_checks != 1){
         assert(in > 0);  
     }
     n2b.in <== in;
-    one_hot <== n2b.bits;
+    component if_else[b];
+    component is_eq[b];
+    for(var i = 0; i< b; i++){
+        is_eq[i] = IsEqual();
+         //* Checks if `in[0]` == `in[1]` and returns the output in `out`.
+        is_eq[i].in[0] <==  n2b.bits[i];
+        is_eq[i].in[1] <== 1;
+        if_else[i] = IfThenElse();
+        if_else[i].cond <== is_eq[i].out;
+        if_else[i].L <== 1;
+        if_else[i].R <== 0;
+        one_hot[i] <-- (if_else[i].out) & 1 ;
+    }
 }
 
 /*
@@ -296,11 +306,21 @@ template Normalize(k, p, P) {
     signal input e;
     signal input m;
     signal input skip_checks;
-    signal output e_out;
-    signal output m_out;
+    signal output e_out[k];
+    signal output m_out[p];
     assert(P > p);
-
+    component msnb =MSNZB(p);
+    component n2be = Num2Bits(k);
     // TODO
+    if(skip_checks != 1){
+        assert(m > 0);  
+    }
+    msnb.in <== m;
+    msnb.skip_checks <== skip_checks;
+    m_out <== msnb.one_hot;
+    n2be.in <== e;
+    e_out <== n2be.bits;
+
 }
 
 /*
