@@ -194,8 +194,13 @@ template CheckWellFormedness(k, p) {
 template RightShift(shift) {
     signal input x;
     signal output y;
-    var t = (x >> shift);
-    y <== t;
+
+    signal rem <-- x % (1 << shift);
+    component num2bits = Num2Bits(shift);
+    num2bits.in <== rem;
+
+    y <-- (x - rem) / (1 << shift);
+    x === y * (1 << shift) + rem;
 }
 
 /*
@@ -254,9 +259,9 @@ template LeftShift(shift_bound) {
     signal input shift;
     signal input skip_checks;
     signal output y;
-
-    //TODO
-    y = (x >> shift);
+    assert( skip_checks == 1 || shift < shift_bound);
+    y <--(x << shift);
+    assert(y >= 0);
 }
 
 /*
@@ -265,13 +270,34 @@ template LeftShift(shift_bound) {
  * The MSNZB is output as a one-hot vector to reduce the number of constraints in the subsequent `Normalize` template.
  * Enforces that `in` is non-zero as MSNZB(0) is undefined.
  * If `skip_checks` = 1, then we don't care about the output and the non-zero constraint is not enforced.
+
  */
 template MSNZB(b) {
     signal input in;
     signal input skip_checks;
     signal output one_hot[b];
-
-    // TODO
+    // Temporary one_hot vector
+    var one_hot_temp[b];
+    assert( skip_checks == 1 || in != 0);   
+    component n2b = Num2Bits(b+1);
+    n2b.in <== in;
+    // 1. Copy over all of the bits 
+    for (var i = 0; i < b; i++) {
+        one_hot_temp[i] = n2b.bits[i];
+    }
+    // Converts lower bits from the b-2th bit
+    for (var i = b-2; i >= 0; i--) {
+        // If one_hot_temp[i] = 1 and one_hot_temp[i+1] = 1 then this will be 0
+        // If one_hot_temp[i] = 0 and one_hot_temp[i+1] = 1 then this will be 1
+        // If one_hot_temp[i] = 1 and one_hot_temp[i+1] = 0 then this will be 0
+        // If one_hot_temp[i] = 0 and one_hot_temp[i+1] = 0 then this will be 0
+        one_hot_temp[i] = one_hot_temp[i] + one_hot_temp[i + 1] * (1 - one_hot_temp[i]);
+    }
+     // start hot encoding from the b-2th bit
+    one_hot[b-1] <== one_hot_temp[b-1];
+    for (var i = b-2; i >= 0; i--) {
+        one_hot[i] <--  one_hot_temp[i] * (1 - one_hot_temp[i + 1]);
+    }
 }
 
 /*
@@ -280,6 +306,20 @@ template MSNZB(b) {
  * The output is a floating-point number representing the same value with exponent `e_out` and a *normalized* mantissa `m_out` of `P`+1-bits and precision `P`.
  * Enforces that `m` is non-zero as a zero-value can not be normalized.
  * If `skip_checks` = 1, then we don't care about the output and the non-zero constraint is not enforced.
+
+
+def normalize(k, p, P, e, m):
+    assert(P > p and m != 0)
+    ''' Let ell be the MSNZB of m. Recall that m is a P+1-bit number with precision p.
+        We want to make the mantissa normalized, i.e., bring it to the range [2^P, 2^(P+1)), by shifting it left by P-ell bits.
+        Consequently, we need to decrement the exponent by P-ell.
+        At the same time, we are also increasing precision of mantissa from p to P, so we also need to increment the exponent by P-p.
+        Overall, this means adding (P-p)-(P-ell) = ell-p to the exponent.
+    '''
+    ell = msnzb(m, P+1)
+    m <<= (P - ell)
+    e = e + ell - p
+    return (e, m)
  */
 template Normalize(k, p, P) {
     signal input e;
@@ -287,10 +327,31 @@ template Normalize(k, p, P) {
     signal input skip_checks;
     signal output e_out;
     signal output m_out;
-    assert(P > p);
 
-    // TODO
+    assert(P > p);
+    assert( skip_checks == 1 || m != 0);
+
+    // helper signals and components 
+    component ls = LeftShift(252);
+    component msn = MSNZB(P+1);
+    msn.in <== m;
+    msn.skip_checks <== skip_checks;
+    signal one_hot[P+1] <== msn.one_hot;
+    //   ell = msnzb(m, P+1)
+    //   e = e + ell - p
+    var ell = 0;
+    for (var i = 0; i <= P; i++) {
+        ell += i * one_hot[i];
+    }
+    var m_shift = P-ell;
+    e_out <== (e + ell - p);
+    //   m <== (P - ell)
+    ls.x <== m;
+    ls.shift <== m_shift;
+    ls.skip_checks <== skip_checks;
+    m_out <== ls.y;
 }
+
 
 /*
  * Adds two floating-point numbers.
@@ -298,6 +359,40 @@ template Normalize(k, p, P) {
  * Does not assume that the inputs are well-formed and makes appropriate checks for the same.
  * The output is a normalized floating-point number with exponent `e_out` and mantissa `m_out` of `p`+1-bits and scale `p`.
  * Enforces that inputs are well-formed.
+
+''' Adds two floating-point numbers.
+    The inputs are normalized floating-point numbers with `k`-bit exponents `e` and `p`+1-bit mantissas `m`.
+'''
+def float_add(k, p, e_1, m_1, e_2, m_2):
+    check_well_formedness(k, p, e_1, m_1)
+    check_well_formedness(k, p, e_2, m_2)
+
+    ''' Arrange numbers in the order of their magnitude.
+        Although not the same as magnitude, comparing e_1 || m_1 against e_2 || m_2 suffices to compare magnitudes.
+    '''
+    mgn_1 = (e_1 << (p+1)) + m_1
+    mgn_2 = (e_2 << (p+1)) + m_2
+    ''' comparison over k+p+1 bits '''
+    if mgn_1 > mgn_2:
+        (alpha_e, alpha_m) = (e_1, m_1)
+        (beta_e, beta_m) = (e_2, m_2)
+    else:
+        (alpha_e, alpha_m) = (e_2, m_2)
+        (beta_e, beta_m) = (e_1, m_1)
+
+    diff = alpha_e - beta_e
+    if diff > p + 1 or alpha_e == 0:
+        return (alpha_e, alpha_m)
+    else:
+        alpha_m <<= diff
+        ''' m fits in 2*p+2 bits '''
+        m = alpha_m + beta_m
+        e = beta_e
+        (normalized_e, normalized_m) = normalize(k, p, 2*p+1, e, m)
+        (e_out, m_out) = round_nearest_and_check(k, p, 2*p+1, normalized_e, normalized_m)
+
+        return (e_out, m_out)
+
  */
 template FloatAdd(k, p) {
     signal input e[2];
@@ -305,5 +400,84 @@ template FloatAdd(k, p) {
     signal output e_out;
     signal output m_out;
 
-    // TODO
+    component c1 = CheckWellFormedness(k, p);
+    component c2 = CheckWellFormedness(k, p);
+    c1.e <== e[0];
+    c1.m <== m[0];
+    c2.e <== e[1];
+    c2.m <== m[1];
+    /*   
+        mgn_1 = (e_1 << (p+1)) + m_1
+        mgn_2 = (e_2 << (p+1)) + m_2
+        ''' comparison over k+p+1 bits '''
+        if mgn_1 > mgn_2:
+            (alpha_e, alpha_m) = (e_1, m_1)
+            (beta_e, beta_m) = (e_2, m_2)
+        else:
+            (alpha_e, alpha_m) = (e_2, m_2)
+            (beta_e, beta_m) = (e_1, m_1)
+    */
+    signal x <-- (e[0] << (p + 1)) ;
+    signal y <-- (e[1] << (p + 1)) ;
+
+    signal mgn1 <== x + m[0];
+    signal mgn2 <== y + m[1];
+    /*
+
+    if diff > p + 1 or alpha_e == 0:
+        return (alpha_e, alpha_m)
+    else:
+        alpha_m <<= diff
+        ''' m fits in 2*p+2 bits '''
+        m = alpha_m + beta_m
+        e = beta_e
+        (normalized_e, normalized_m) = normalize(k, p, 2*p+1, e, m)
+        (e_out, m_out) = round_nearest_and_check(k, p, 2*p+1, normalized_e, normalized_m)
+
+        return (e_out, m_out)
+
+    */
+    signal swp <-- mgn1 > mgn2;
+     // Alpha E and Beta E/M
+    signal alpha_e <-- swp ? e[0] : e[1];
+    signal beta_e <-- swp ? e[1] : e[0];
+    signal alpha_m <-- swp ? m[0] : m[1];
+    signal beta_m <-- swp? m[1] : m[0];
+    // According to sample code: diff = alpha_e - beta_e
+    signal diff <-- alpha_e - beta_e;
+    signal gt <-- diff > (p + 1) ? 1 : 0;
+    signal res_condition <-- alpha_e == 0 || gt;
+    /*
+    
+    else:
+        alpha_m <<= diff
+        ''' m fits in 2*p+2 bits '''
+        m = alpha_m + beta_m
+        e = beta_e
+        (normalized_e, normalized_m) = normalize(k, p, 2*p+1, e, m)
+        (e_out, m_out) = round_nearest_and_check(k, p, 2*p+1, normalized_e, normalized_m)
+
+        return (e_out, m_out)
+    */
+    signal alpha_temp_m <-- alpha_m << diff;
+    signal m_temp <-- alpha_temp_m  + beta_m;
+
+    component normalized = Normalize(k, p, 2*p + 1);
+    normalized.m <== m_temp;
+    normalized.e <== beta_e;
+    
+    normalized.skip_checks <== res_condition;
+
+    component rounded_check = RoundAndCheck(k, p, 2*p + 1);
+    /*
+        e = beta_e
+        (normalized_e, normalized_m) = normalize(k, p, 2*p+1, e, m)
+        (e_out, m_out) = round_nearest_and_check(k, p, 2*p+1, normalized_e, normalized_m)
+    */
+    signal rounded_e <-- res_condition ? 1 : normalized.e_out ;
+    signal rounded_m <-- res_condition ? 1 : normalized.m_out ;
+    rounded_check.e <== rounded_e;
+    rounded_check.m <== rounded_m;
+    m_out <-- res_condition ? alpha_m : rounded_check.m_out;
+    e_out <-- res_condition ? alpha_e : rounded_check.e_out;
 }
